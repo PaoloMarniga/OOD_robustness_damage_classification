@@ -23,16 +23,17 @@ from torchvision.models import resnet50, ResNet50_Weights
 # =========================
 # Configuration
 # =========================
+
 BASE_DIR = Path.home() / "Desktop"
 CSV_PATH = BASE_DIR / "processed" / "buildings_all_with_crops.csv"
 
-OUTPUT_DIR = BASE_DIR / "training_outputs" / "baseline_resnet50_3seeds_1sd"
+OUTPUT_DIR = BASE_DIR / "training_outputs" / "baseline_resnet50_5seeds_1se"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-SEEDS = [42, 123, 999]
+SEEDS = [42, 123, 999, 2024, 2025]
 
 BATCH_SIZE = 32
-NUM_EPOCHS = 10
+NUM_EPOCHS = 8
 LEARNING_RATE = 1e-4
 NUM_WORKERS = 2
 USE_CLASS_WEIGHTS = True
@@ -58,10 +59,21 @@ LABEL_TO_IDX = {
 IDX_TO_LABEL = {v: k for k, v in LABEL_TO_IDX.items()}
 LABEL_IDS = [0, 1, 2, 3]
 
+IMAGENET_MEAN_6 = np.array(
+    [0.485, 0.456, 0.406, 0.485, 0.456, 0.406],
+    dtype=np.float32,
+)
+
+IMAGENET_STD_6 = np.array(
+    [0.229, 0.224, 0.225, 0.229, 0.224, 0.225],
+    dtype=np.float32,
+)
+
 
 # =========================
 # Reproducibility
 # =========================
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -83,6 +95,7 @@ def seed_worker(worker_id):
 # =========================
 # Device selection
 # =========================
+
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -95,17 +108,12 @@ def get_device():
 # =========================
 # Utility functions
 # =========================
+
 def find_environment_column(df: pd.DataFrame):
     for col in ENV_COLUMN_CANDIDATES:
         if col in df.columns:
             return col
     return None
-
-
-def safe_float(x):
-    if x is None:
-        return None
-    return float(x)
 
 
 def make_json_safe(obj):
@@ -125,6 +133,7 @@ def make_json_safe(obj):
 # =========================
 # Dataset
 # =========================
+
 class XViewBuildingDataset(Dataset):
     def __init__(self, dataframe):
         self.df = dataframe.reset_index(drop=True)
@@ -136,8 +145,17 @@ class XViewBuildingDataset(Dataset):
         row = self.df.iloc[idx]
 
         x = np.load(row["crop_path"])
+
+        if x.ndim != 3:
+            raise ValueError(f"Expected crop with shape H,W,C. Got shape {x.shape}")
+
+        if x.shape[2] != 6:
+            raise ValueError(f"Expected 6 channels. Got shape {x.shape}")
+
         x = x.astype(np.float32) / 255.0
         x = np.transpose(x, (2, 0, 1))
+
+        x = (x - IMAGENET_MEAN_6[:, None, None]) / IMAGENET_STD_6[:, None, None]
 
         y = LABEL_TO_IDX[row["damage_label"]]
 
@@ -147,6 +165,7 @@ class XViewBuildingDataset(Dataset):
 # =========================
 # Model
 # =========================
+
 class ResNet50SixChannel(nn.Module):
     def __init__(self, num_classes=4):
         super().__init__()
@@ -166,8 +185,8 @@ class ResNet50SixChannel(nn.Module):
         )
 
         with torch.no_grad():
-            new_conv.weight[:, :3, :, :] = old_conv.weight
-            new_conv.weight[:, 3:, :, :] = old_conv.weight
+            new_conv.weight[:, :3, :, :] = old_conv.weight * 0.5
+            new_conv.weight[:, 3:, :, :] = old_conv.weight * 0.5
 
         self.backbone.conv1 = new_conv
         self.backbone.fc = nn.Linear(self.backbone.fc.in_features, num_classes)
@@ -179,6 +198,7 @@ class ResNet50SixChannel(nn.Module):
 # =========================
 # Evaluation
 # =========================
+
 def evaluate(model, loader, criterion, device, desc="Evaluating"):
     model.eval()
 
@@ -323,13 +343,10 @@ def compute_per_environment_table(
         }
 
         for idx in LABEL_IDS:
-            row[f"f1_{IDX_TO_LABEL[idx].replace('-', '_')}"] = float(per_class[idx])
-            row[f"true_{IDX_TO_LABEL[idx].replace('-', '_')}"] = int(
-                (group["target"] == idx).sum()
-            )
-            row[f"pred_{IDX_TO_LABEL[idx].replace('-', '_')}"] = int(
-                (group["pred"] == idx).sum()
-            )
+            name = IDX_TO_LABEL[idx].replace("-", "_")
+            row[f"f1_{name}"] = float(per_class[idx])
+            row[f"true_{name}"] = int((group["target"] == idx).sum())
+            row[f"pred_{name}"] = int((group["pred"] == idx).sum())
 
         rows.append(row)
 
@@ -378,35 +395,41 @@ def save_prediction_dataframe(
 # =========================
 # Training one seed
 # =========================
+
 def train_one_seed(
     seed,
     train_df,
     val_df,
-    hold_df,
     train_loader,
     val_loader,
-    hold_loader,
     device,
-    env_col,
 ):
     set_seed(seed)
 
     seed_dir = OUTPUT_DIR / f"seed_{seed}"
     checkpoint_dir = seed_dir / "checkpoints"
+
     seed_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 80)
-    print(f"Starting seed {seed}")
+    print(f"Starting baseline seed {seed}")
     print("=" * 80)
 
     model = ResNet50SixChannel(num_classes=4).to(device)
 
     if USE_CLASS_WEIGHTS:
+        y_train = train_df["damage_label"].map(LABEL_TO_IDX).values
+        present_classes = set(y_train.tolist())
+        missing_classes = set(LABEL_IDS) - present_classes
+
+        if missing_classes:
+            raise ValueError(f"Missing classes in training data: {missing_classes}")
+
         weights = compute_class_weight(
             class_weight="balanced",
             classes=np.array(LABEL_IDS),
-            y=train_df["damage_label"].map(LABEL_TO_IDX).values,
+            y=y_train,
         )
         weights = torch.tensor(weights, dtype=torch.float32).to(device)
         criterion = nn.CrossEntropyLoss(weight=weights)
@@ -507,9 +530,10 @@ def train_one_seed(
 
 
 # =========================
-# 1SD model selection
+# 1SE model selection
 # =========================
-def select_epoch_1sd(all_history_df):
+
+def select_epoch_1se(all_history_df):
     epoch_summary = (
         all_history_df.groupby("epoch")["val_macro_f1"]
         .agg(["mean", "std", "count"])
@@ -525,41 +549,44 @@ def select_epoch_1sd(all_history_df):
 
     epoch_summary["val_macro_f1_std"] = epoch_summary["val_macro_f1_std"].fillna(0.0)
 
+    epoch_summary["val_macro_f1_se"] = (
+        epoch_summary["val_macro_f1_std"] / np.sqrt(epoch_summary["num_seeds"])
+    )
+
     best_idx = epoch_summary["val_macro_f1_mean"].idxmax()
     best_row = epoch_summary.loc[best_idx]
 
     best_epoch = int(best_row["epoch"])
     best_mean = float(best_row["val_macro_f1_mean"])
-    best_sd = float(best_row["val_macro_f1_std"])
+    best_std = float(best_row["val_macro_f1_std"])
+    best_se = float(best_row["val_macro_f1_se"])
 
-    threshold = best_mean - best_sd
+    threshold = best_mean - best_se
 
     eligible = epoch_summary[epoch_summary["val_macro_f1_mean"] >= threshold].copy()
     selected_epoch = int(eligible["epoch"].min())
 
-    epoch_summary["one_sd_threshold"] = threshold
+    epoch_summary["one_se_threshold"] = threshold
     epoch_summary["is_best_mean_epoch"] = epoch_summary["epoch"] == best_epoch
-    epoch_summary["is_eligible_1sd"] = (
-        epoch_summary["val_macro_f1_mean"] >= threshold
-    )
-    epoch_summary["is_selected_1sd_epoch"] = (
-        epoch_summary["epoch"] == selected_epoch
-    )
+    epoch_summary["is_eligible_1se"] = epoch_summary["val_macro_f1_mean"] >= threshold
+    epoch_summary["is_selected_1se_epoch"] = epoch_summary["epoch"] == selected_epoch
 
     selection_info = {
         "best_epoch_by_mean_validation_f1": best_epoch,
         "best_mean_validation_macro_f1": best_mean,
-        "sd_at_best_epoch": best_sd,
-        "one_sd_threshold": threshold,
-        "selected_epoch_1sd_rule": selected_epoch,
+        "std_at_best_epoch": best_std,
+        "se_at_best_epoch": best_se,
+        "one_se_threshold": threshold,
+        "selected_epoch_1se_rule": selected_epoch,
     }
 
     return selected_epoch, epoch_summary, selection_info
 
 
 # =========================
-# Evaluate selected epoch for all seeds
+# Final evaluation
 # =========================
+
 def evaluate_selected_epoch_for_seed(
     seed,
     selected_epoch,
@@ -594,7 +621,7 @@ def evaluate_selected_epoch_for_seed(
         criterion = nn.CrossEntropyLoss()
 
     print("\n" + "-" * 80)
-    print(f"Evaluating seed {seed}, selected epoch {selected_epoch}")
+    print(f"Evaluating baseline seed {seed}, selected epoch {selected_epoch}")
     print("-" * 80)
 
     final_val = evaluate(
@@ -614,76 +641,48 @@ def evaluate_selected_epoch_for_seed(
     )
 
     print(f"\nSeed {seed} | Final VAL Macro F1: {final_val['macro_f1']:.4f}")
-    print(
-        classification_report_text(
-            final_val["targets"],
-            final_val["preds"],
-        )
-    )
+    print(classification_report_text(final_val["targets"], final_val["preds"]))
 
     print(f"\nSeed {seed} | Final HOLD Macro F1: {final_hold['macro_f1']:.4f}")
-    print(
-        classification_report_text(
-            final_hold["targets"],
-            final_hold["preds"],
-        )
-    )
+    print(classification_report_text(final_hold["targets"], final_hold["preds"]))
 
-    # Save numpy arrays
-    np.save(seed_dir / "val_preds_selected_1sd.npy", np.array(final_val["preds"]))
-    np.save(seed_dir / "val_targets_selected_1sd.npy", np.array(final_val["targets"]))
-    np.save(seed_dir / "hold_preds_selected_1sd.npy", np.array(final_hold["preds"]))
-    np.save(seed_dir / "hold_targets_selected_1sd.npy", np.array(final_hold["targets"]))
+    np.save(seed_dir / "val_preds_selected_1se.npy", np.array(final_val["preds"]))
+    np.save(seed_dir / "val_targets_selected_1se.npy", np.array(final_val["targets"]))
+    np.save(seed_dir / "hold_preds_selected_1se.npy", np.array(final_hold["preds"]))
+    np.save(seed_dir / "hold_targets_selected_1se.npy", np.array(final_hold["targets"]))
 
-    # Save confusion matrices
-    val_cm = confusion_matrix(
-        final_val["targets"],
-        final_val["preds"],
-        labels=LABEL_IDS,
-    )
-    hold_cm = confusion_matrix(
-        final_hold["targets"],
-        final_hold["preds"],
-        labels=LABEL_IDS,
-    )
+    val_cm = confusion_matrix(final_val["targets"], final_val["preds"], labels=LABEL_IDS)
+    hold_cm = confusion_matrix(final_hold["targets"], final_hold["preds"], labels=LABEL_IDS)
 
-    np.save(seed_dir / "val_confusion_matrix_selected_1sd.npy", val_cm)
-    np.save(seed_dir / "hold_confusion_matrix_selected_1sd.npy", hold_cm)
+    np.save(seed_dir / "val_confusion_matrix_selected_1se.npy", val_cm)
+    np.save(seed_dir / "hold_confusion_matrix_selected_1se.npy", hold_cm)
 
     pd.DataFrame(
         val_cm,
         index=[IDX_TO_LABEL[i] for i in LABEL_IDS],
         columns=[IDX_TO_LABEL[i] for i in LABEL_IDS],
-    ).to_csv(seed_dir / "val_confusion_matrix_selected_1sd.csv")
+    ).to_csv(seed_dir / "val_confusion_matrix_selected_1se.csv")
 
     pd.DataFrame(
         hold_cm,
         index=[IDX_TO_LABEL[i] for i in LABEL_IDS],
         columns=[IDX_TO_LABEL[i] for i in LABEL_IDS],
-    ).to_csv(seed_dir / "hold_confusion_matrix_selected_1sd.csv")
+    ).to_csv(seed_dir / "hold_confusion_matrix_selected_1se.csv")
 
-    # Save classification reports
-    val_report = classification_report_dict(
-        final_val["targets"],
-        final_val["preds"],
-    )
-    hold_report = classification_report_dict(
-        final_hold["targets"],
-        final_hold["preds"],
-    )
+    val_report = classification_report_dict(final_val["targets"], final_val["preds"])
+    hold_report = classification_report_dict(final_hold["targets"], final_hold["preds"])
 
-    with open(seed_dir / "val_classification_report_selected_1sd.json", "w", encoding="utf-8") as f:
+    with open(seed_dir / "val_classification_report_selected_1se.json", "w", encoding="utf-8") as f:
         json.dump(make_json_safe(val_report), f, indent=2)
 
-    with open(seed_dir / "hold_classification_report_selected_1sd.json", "w", encoding="utf-8") as f:
+    with open(seed_dir / "hold_classification_report_selected_1se.json", "w", encoding="utf-8") as f:
         json.dump(make_json_safe(hold_report), f, indent=2)
 
-    # Save prediction dataframes for later qualitative and error analysis
     save_prediction_dataframe(
         val_df,
         final_val["preds"],
         final_val["targets"],
-        seed_dir / "val_predictions_selected_1sd.csv",
+        seed_dir / "val_predictions_selected_1se.csv",
         env_col,
     )
 
@@ -691,11 +690,10 @@ def evaluate_selected_epoch_for_seed(
         hold_df,
         final_hold["preds"],
         final_hold["targets"],
-        seed_dir / "hold_predictions_selected_1sd.csv",
+        seed_dir / "hold_predictions_selected_1se.csv",
         env_col,
     )
 
-    # Per-class tables
     val_per_class = compute_per_class_table(
         final_val,
         split_name="validation",
@@ -711,9 +709,8 @@ def evaluate_selected_epoch_for_seed(
     )
 
     per_class = pd.concat([val_per_class, hold_per_class], ignore_index=True)
-    per_class.to_csv(seed_dir / "per_class_metrics_selected_1sd.csv", index=False)
+    per_class.to_csv(seed_dir / "per_class_metrics_selected_1se.csv", index=False)
 
-    # Per-environment tables
     val_per_env = compute_per_environment_table(
         val_df,
         final_val["preds"],
@@ -735,10 +732,10 @@ def evaluate_selected_epoch_for_seed(
     )
 
     if len(val_per_env) > 0:
-        val_per_env.to_csv(seed_dir / "val_per_environment_metrics_selected_1sd.csv", index=False)
+        val_per_env.to_csv(seed_dir / "val_per_environment_metrics_selected_1se.csv", index=False)
 
     if len(hold_per_env) > 0:
-        hold_per_env.to_csv(seed_dir / "hold_per_environment_metrics_selected_1sd.csv", index=False)
+        hold_per_env.to_csv(seed_dir / "hold_per_environment_metrics_selected_1se.csv", index=False)
 
     worst_val_env = None
     worst_hold_env = None
@@ -751,7 +748,7 @@ def evaluate_selected_epoch_for_seed(
 
     result = {
         "seed": seed,
-        "selected_epoch_1sd": selected_epoch,
+        "selected_epoch_1se": selected_epoch,
         "val_macro_f1": float(final_val["macro_f1"]),
         "hold_macro_f1": float(final_hold["macro_f1"]),
         "val_loss": float(final_val["loss"]),
@@ -768,7 +765,7 @@ def evaluate_selected_epoch_for_seed(
         "worst_hold_environment": worst_hold_env,
     }
 
-    with open(seed_dir / "selected_1sd_results_summary.json", "w", encoding="utf-8") as f:
+    with open(seed_dir / "selected_1se_results_summary.json", "w", encoding="utf-8") as f:
         json.dump(make_json_safe(result), f, indent=2)
 
     return result
@@ -777,8 +774,9 @@ def evaluate_selected_epoch_for_seed(
 # =========================
 # Main
 # =========================
+
 def main():
-    print("Loading data...")
+    print("Loading baseline split data...")
     df = pd.read_csv(CSV_PATH)
 
     required_splits = {TRAIN_SPLIT, VAL_SPLIT, FINAL_TEST_SPLIT}
@@ -793,12 +791,9 @@ def main():
     env_col = find_environment_column(df)
 
     if env_col is None:
-        print(
-            "\nWARNING: No environment column found. "
-            "Per-environment analysis will be skipped."
-        )
+        print("\nWARNING: No environment column found. Per environment analysis will be skipped.")
     else:
-        print(f"\nUsing environment column for per-environment analysis: {env_col}")
+        print(f"\nUsing environment column for per environment analysis: {env_col}")
 
     train_df = df[df["split"] == TRAIN_SPLIT].copy().reset_index(drop=True)
     val_df = df[df["split"] == VAL_SPLIT].copy().reset_index(drop=True)
@@ -860,22 +855,13 @@ def main():
             **loader_kwargs,
         )
 
-        hold_loader = DataLoader(
-            XViewBuildingDataset(hold_df),
-            shuffle=False,
-            **loader_kwargs,
-        )
-
         history_df = train_one_seed(
             seed=seed,
             train_df=train_df,
             val_df=val_df,
-            hold_df=hold_df,
             train_loader=train_loader,
             val_loader=val_loader,
-            hold_loader=hold_loader,
             device=device,
-            env_col=env_col,
         )
 
         all_histories.append(history_df)
@@ -883,19 +869,18 @@ def main():
     all_history_df = pd.concat(all_histories, ignore_index=True)
     all_history_df.to_csv(OUTPUT_DIR / "all_seed_training_history.csv", index=False)
 
-    selected_epoch, epoch_summary, selection_info = select_epoch_1sd(all_history_df)
+    selected_epoch, epoch_summary, selection_info = select_epoch_1se(all_history_df)
 
-    epoch_summary.to_csv(OUTPUT_DIR / "epoch_validation_summary_1sd_rule.csv", index=False)
+    epoch_summary.to_csv(OUTPUT_DIR / "epoch_validation_summary_1se_rule.csv", index=False)
 
-    with open(OUTPUT_DIR / "model_selection_1sd_rule.json", "w", encoding="utf-8") as f:
+    with open(OUTPUT_DIR / "model_selection_1se_rule.json", "w", encoding="utf-8") as f:
         json.dump(make_json_safe(selection_info), f, indent=2)
 
     print("\n" + "=" * 80)
-    print("1SD model selection")
+    print("1SE model selection")
     print("=" * 80)
     print(json.dumps(selection_info, indent=2))
 
-    # Recreate loaders for final evaluation
     final_results = []
 
     for seed in SEEDS:
@@ -941,7 +926,7 @@ def main():
         final_results.append(result)
 
     final_results_df = pd.DataFrame(final_results)
-    final_results_df.to_csv(OUTPUT_DIR / "final_results_by_seed_selected_1sd.csv", index=False)
+    final_results_df.to_csv(OUTPUT_DIR / "final_results_by_seed_selected_1se.csv", index=False)
 
     metric_cols = [
         "val_macro_f1",
@@ -968,6 +953,7 @@ def main():
                 "metric": metric,
                 "mean": float(values.mean()),
                 "std": float(values.std(ddof=1)),
+                "se": float(values.std(ddof=1) / np.sqrt(values.count())),
                 "min": float(values.min()),
                 "max": float(values.max()),
                 "num_seeds": int(values.count()),
@@ -975,19 +961,18 @@ def main():
         )
 
     aggregate_df = pd.DataFrame(aggregate_rows)
-    aggregate_df.to_csv(OUTPUT_DIR / "final_results_mean_std_selected_1sd.csv", index=False)
+    aggregate_df.to_csv(OUTPUT_DIR / "final_results_mean_std_se_selected_1se.csv", index=False)
 
-    # Aggregate per-class metrics across seeds
     per_class_all = []
 
     for seed in SEEDS:
-        path = OUTPUT_DIR / f"seed_{seed}" / "per_class_metrics_selected_1sd.csv"
+        path = OUTPUT_DIR / f"seed_{seed}" / "per_class_metrics_selected_1se.csv"
         if path.exists():
             per_class_all.append(pd.read_csv(path))
 
     if per_class_all:
         per_class_all_df = pd.concat(per_class_all, ignore_index=True)
-        per_class_all_df.to_csv(OUTPUT_DIR / "all_seed_per_class_metrics_selected_1sd.csv", index=False)
+        per_class_all_df.to_csv(OUTPUT_DIR / "all_seed_per_class_metrics_selected_1se.csv", index=False)
 
         per_class_summary = (
             per_class_all_df.groupby(["split", "class_id", "class_name"])["f1"]
@@ -1004,23 +989,26 @@ def main():
             )
         )
 
+        per_class_summary["f1_se"] = per_class_summary["f1_std"] / np.sqrt(
+            per_class_summary["num_seeds"]
+        )
+
         per_class_summary.to_csv(
-            OUTPUT_DIR / "per_class_metrics_mean_std_selected_1sd.csv",
+            OUTPUT_DIR / "per_class_metrics_mean_std_se_selected_1se.csv",
             index=False,
         )
 
-    # Aggregate per-environment metrics across seeds
     per_env_all = []
 
     for seed in SEEDS:
         for split_name in ["val", "hold"]:
-            path = OUTPUT_DIR / f"seed_{seed}" / f"{split_name}_per_environment_metrics_selected_1sd.csv"
+            path = OUTPUT_DIR / f"seed_{seed}" / f"{split_name}_per_environment_metrics_selected_1se.csv"
             if path.exists():
                 per_env_all.append(pd.read_csv(path))
 
     if per_env_all:
         per_env_all_df = pd.concat(per_env_all, ignore_index=True)
-        per_env_all_df.to_csv(OUTPUT_DIR / "all_seed_per_environment_metrics_selected_1sd.csv", index=False)
+        per_env_all_df.to_csv(OUTPUT_DIR / "all_seed_per_environment_metrics_selected_1se.csv", index=False)
 
         per_env_summary = (
             per_env_all_df.groupby(["split", "environment"])["macro_f1"]
@@ -1037,8 +1025,12 @@ def main():
             )
         )
 
+        per_env_summary["macro_f1_se"] = per_env_summary["macro_f1_std"] / np.sqrt(
+            per_env_summary["num_seeds"]
+        )
+
         per_env_summary.to_csv(
-            OUTPUT_DIR / "per_environment_metrics_mean_std_selected_1sd.csv",
+            OUTPUT_DIR / "per_environment_metrics_mean_std_se_selected_1se.csv",
             index=False,
         )
 
@@ -1073,19 +1065,19 @@ def main():
         "worst_hold_environment_by_mean_macro_f1": worst_env_row,
     }
 
-    with open(OUTPUT_DIR / "final_summary_selected_1sd.json", "w", encoding="utf-8") as f:
+    with open(OUTPUT_DIR / "final_summary_selected_1se.json", "w", encoding="utf-8") as f:
         json.dump(make_json_safe(final_summary), f, indent=2)
 
     print("\n" + "=" * 80)
-    print("Final mean ± std across seeds")
+    print("Final baseline mean, std, and SE across seeds")
     print("=" * 80)
     print(aggregate_df)
 
     if worst_env_row is not None:
-        print("\nWorst hold environment by mean macro-F1:")
+        print("\nWorst hold environment by mean macro F1:")
         print(worst_env_row)
 
-    print("\nSaved all outputs successfully.")
+    print("\nSaved all baseline split outputs successfully.")
     print(OUTPUT_DIR)
 
 
