@@ -12,7 +12,6 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
 )
-from sklearn.utils.class_weight import compute_class_weight
 
 import torch
 import torch.nn as nn
@@ -28,7 +27,7 @@ from torchvision.models import resnet50, ResNet50_Weights
 BASE_DIR = Path.home() / "Desktop"
 CSV_PATH = BASE_DIR / "OOD_processed" / "buildings_all_OOD_with_crops.csv"
 
-OUTPUT_DIR = BASE_DIR / "OOD_training_outputs" / "resnet50_supervised_contrastive_5seeds_1se"
+OUTPUT_DIR = BASE_DIR / "OOD_training_outputs" / "resnet50_supervised_contrastive_unweighted_5seeds_1se"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SEEDS = [42, 123, 999, 2024, 2025]
@@ -43,7 +42,6 @@ CONTRASTIVE_LR = 1e-4
 CLASSIFIER_LR = 1e-4
 ENCODER_FINETUNE_LR = 1e-5
 
-USE_CLASS_WEIGHTS_CLASSIFIER = True
 USE_BALANCED_CONTRASTIVE_SAMPLER = True
 LABEL_SMOOTHING = 0.10
 
@@ -143,23 +141,6 @@ def make_json_safe(obj):
     return obj
 
 
-def compute_train_class_weights(train_df):
-    y_train = train_df["damage_label"].map(LABEL_TO_IDX).values
-    present_classes = set(y_train.tolist())
-    missing_classes = set(LABEL_IDS) - present_classes
-
-    if missing_classes:
-        raise ValueError(f"Missing classes in training data: {missing_classes}")
-
-    weights = compute_class_weight(
-        class_weight="balanced",
-        classes=np.array(LABEL_IDS),
-        y=y_train,
-    )
-
-    return weights.astype(np.float32)
-
-
 def make_balanced_sampler(train_df, seed):
     y = train_df["damage_label"].map(LABEL_TO_IDX).values
     class_counts = np.bincount(y, minlength=len(LABEL_IDS)).astype(np.float32)
@@ -248,9 +229,6 @@ class XViewBuildingDataset(Dataset):
                 torch.tensor(x2, dtype=torch.float32),
                 torch.tensor(y, dtype=torch.long),
             )
-
-        if self.train:
-            x = self.augment_0_1(x)
 
         x = self.normalize(x)
 
@@ -598,7 +576,6 @@ def run_ood_leakage_checks(train_df, val_df, hold_df, env_col):
 
 def train_one_seed(
     seed,
-    train_df,
     val_loader,
     contrastive_loader,
     classifier_loader,
@@ -705,23 +682,12 @@ def train_one_seed(
         index=False,
     )
 
-    class_weights_np = None
+    classifier_criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
-    if USE_CLASS_WEIGHTS_CLASSIFIER:
-        class_weights_np = compute_train_class_weights(train_df)
-        class_weights = torch.tensor(class_weights_np, dtype=torch.float32).to(device)
-
-        classifier_criterion = nn.CrossEntropyLoss(
-            weight=class_weights,
-            label_smoothing=LABEL_SMOOTHING,
-        )
-
-        print("\nUsing weighted cross entropy for classifier fine tuning:")
-        print(class_weights.cpu().numpy())
-
-    else:
-        classifier_criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
-        print("\nUsing unweighted cross entropy for classifier fine tuning.")
+    print(
+        "\nUsing unweighted cross entropy for classifier fine tuning "
+        f"with label_smoothing={LABEL_SMOOTHING}."
+    )
 
     classifier_head = DamageClassifierHead(
         input_dim=FEATURE_DIM,
@@ -819,7 +785,8 @@ def train_one_seed(
                 "optimizer_state_dict": classifier_optimizer.state_dict(),
                 "ood_val_macro_f1": float(val_metrics["macro_f1"]),
                 "ood_val_loss": float(val_metrics["loss"]),
-                "class_weights": class_weights_np,
+                "class_weights": None,
+                "label_smoothing": LABEL_SMOOTHING,
             },
             checkpoint_dir / f"classifier_epoch_{epoch:02d}.pt",
         )
@@ -921,16 +888,7 @@ def evaluate_selected_epoch_for_seed(
 
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    if USE_CLASS_WEIGHTS_CLASSIFIER:
-        class_weights_np = checkpoint["class_weights"]
-        class_weights = torch.tensor(class_weights_np, dtype=torch.float32).to(device)
-
-        criterion = nn.CrossEntropyLoss(
-            weight=class_weights,
-            label_smoothing=LABEL_SMOOTHING,
-        )
-    else:
-        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
     print("\n" + "-" * 80)
     print(f"Evaluating SupCon OOD seed {seed}, selected classifier epoch {selected_epoch}")
@@ -1007,14 +965,14 @@ def evaluate_selected_epoch_for_seed(
         final_val,
         split_name="ood_validation",
         seed=seed,
-        method_name="resnet50_supervised_contrastive",
+        method_name="resnet50_supervised_contrastive_unweighted",
     )
 
     hold_per_class = compute_per_class_table(
         final_hold,
         split_name="ood_hold",
         seed=seed,
-        method_name="resnet50_supervised_contrastive",
+        method_name="resnet50_supervised_contrastive_unweighted",
     )
 
     per_class = pd.concat([val_per_class, hold_per_class], ignore_index=True)
@@ -1027,7 +985,7 @@ def evaluate_selected_epoch_for_seed(
         env_col,
         split_name="ood_validation",
         seed=seed,
-        method_name="resnet50_supervised_contrastive",
+        method_name="resnet50_supervised_contrastive_unweighted",
     )
 
     hold_per_env = compute_per_environment_table(
@@ -1037,7 +995,7 @@ def evaluate_selected_epoch_for_seed(
         env_col,
         split_name="ood_hold",
         seed=seed,
-        method_name="resnet50_supervised_contrastive",
+        method_name="resnet50_supervised_contrastive_unweighted",
     )
 
     if len(val_per_env) > 0:
@@ -1182,7 +1140,6 @@ def main():
 
         history_df = train_one_seed(
             seed=seed,
-            train_df=train_df,
             val_loader=val_loader,
             contrastive_loader=contrastive_loader,
             classifier_loader=classifier_loader,
@@ -1369,7 +1326,7 @@ def main():
         worst_env_row = None
 
     final_summary = {
-        "method": "resnet50_supervised_contrastive",
+        "method": "resnet50_supervised_contrastive_unweighted",
         "seeds": SEEDS,
         "num_seeds": len(SEEDS),
         "batch_size": BATCH_SIZE,
@@ -1384,7 +1341,7 @@ def main():
         "feature_dim": FEATURE_DIM,
         "label_smoothing": LABEL_SMOOTHING,
         "use_balanced_contrastive_sampler": USE_BALANCED_CONTRASTIVE_SAMPLER,
-        "use_class_weights_classifier": USE_CLASS_WEIGHTS_CLASSIFIER,
+        "use_class_weights_classifier": False,
         "device": str(device),
         "train_split": TRAIN_SPLIT,
         "validation_split": VAL_SPLIT,
@@ -1397,8 +1354,9 @@ def main():
         "final_metric_summary": aggregate_df.to_dict(orient="records"),
         "worst_ood_hold_environment_by_mean_macro_f1": worst_env_row,
         "method_note": (
-            "Supervised contrastive pretraining uses augmented positive views and a class-balanced sampler. "
-            "Classifier fine tuning does not use data augmentation and uses train-based class-weighted cross entropy."
+            "Supervised contrastive pretraining uses augmented positive views and a class balanced sampler. "
+            "Classifier fine tuning does not use data augmentation and uses unweighted cross entropy with label smoothing. "
+            "Class weights are not used during classifier fine tuning because balanced sampling is already applied during the contrastive representation stage."
         ),
     }
 
