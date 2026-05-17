@@ -11,7 +11,6 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
 )
-from sklearn.utils.class_weight import compute_class_weight
 from tqdm.auto import tqdm
 
 import torch
@@ -28,7 +27,7 @@ from torchvision.models import resnet50, ResNet50_Weights
 BASE_DIR = Path.home() / "Desktop"
 CSV_PATH = BASE_DIR / "OOD_processed" / "buildings_all_OOD_with_crops.csv"
 
-OUTPUT_DIR = BASE_DIR / "OOD_training_outputs" / "baseline_resnet50_dro_5seeds_1se"
+OUTPUT_DIR = BASE_DIR / "OOD_training_outputs" / "baseline_resnet50_dro_unweighted_5seeds_1se"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SEEDS = [42, 123, 999, 2024, 2025]
@@ -38,7 +37,7 @@ NUM_EPOCHS = 8
 LEARNING_RATE = 1e-4
 NUM_WORKERS = 2
 
-USE_CLASS_WEIGHTS = True
+LABEL_SMOOTHING = 0.10
 
 DRO_ETA = 1.0
 DRO_AVG_RISK_WEIGHT = 0.5
@@ -137,23 +136,6 @@ def make_json_safe(obj):
     return obj
 
 
-def compute_train_class_weights(train_df):
-    y_train = train_df["damage_label"].map(LABEL_TO_IDX).values
-    present_classes = set(y_train.tolist())
-    missing_classes = set(LABEL_IDS) - present_classes
-
-    if missing_classes:
-        raise ValueError(f"Missing classes in training data: {missing_classes}")
-
-    weights = compute_class_weight(
-        class_weight="balanced",
-        classes=np.array(LABEL_IDS),
-        y=y_train,
-    )
-
-    return weights.astype(np.float32)
-
-
 # =========================
 # Dataset
 # =========================
@@ -233,12 +215,12 @@ class ResNet50SixChannel(nn.Module):
 # DRO objective
 # =========================
 
-def dro_group_loss(logits, y, g, class_weights=None):
+def dro_group_loss(logits, y, g):
     per_sample_losses = F.cross_entropy(
         logits,
         y,
-        weight=class_weights,
         reduction="none",
+        label_smoothing=LABEL_SMOOTHING,
     )
 
     group_losses = []
@@ -489,7 +471,6 @@ def run_ood_leakage_checks(train_df, val_df, hold_df, env_col):
 
 def train_one_seed(
     seed,
-    train_df,
     train_loader,
     val_loader,
     device,
@@ -509,23 +490,13 @@ def train_one_seed(
 
     model = ResNet50SixChannel(num_classes=4).to(device)
 
-    if USE_CLASS_WEIGHTS:
-        class_weights_np = compute_train_class_weights(train_df)
-        class_weights = torch.tensor(class_weights_np, dtype=torch.float32).to(device)
-        print("\nUsing class weights:")
-        print(class_weights.cpu().numpy())
-    else:
-        class_weights_np = None
-        class_weights = None
-        print("\nUsing unweighted cross entropy.")
-
-    eval_criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     history = []
 
-    print("\nStarting DRO training...")
+    print("\nStarting DRO training without class weights...")
 
     for epoch in range(1, NUM_EPOCHS + 1):
         epoch_start = time.time()
@@ -553,7 +524,6 @@ def train_one_seed(
                 logits,
                 y,
                 g,
-                class_weights=class_weights,
             )
 
             if torch.isnan(loss):
@@ -572,7 +542,7 @@ def train_one_seed(
         val_metrics = evaluate(
             model,
             val_loader,
-            eval_criterion,
+            criterion,
             device,
             desc=f"Seed {seed} | OOD validation eval epoch {epoch}",
         )
@@ -610,8 +580,11 @@ def train_one_seed(
                 "optimizer_state_dict": optimizer.state_dict(),
                 "ood_val_macro_f1": float(val_metrics["macro_f1"]),
                 "ood_val_loss": float(val_metrics["loss"]),
-                "class_weights": class_weights_np,
                 "group_to_idx": group_to_idx,
+                "label_smoothing": LABEL_SMOOTHING,
+                "dro_eta": DRO_ETA,
+                "dro_avg_risk_weight": DRO_AVG_RISK_WEIGHT,
+                "dro_worst_risk_weight": DRO_WORST_RISK_WEIGHT,
             },
             checkpoint_dir / f"epoch_{epoch:02d}.pt",
         )
@@ -706,12 +679,7 @@ def evaluate_selected_epoch_for_seed(
 
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    if USE_CLASS_WEIGHTS:
-        class_weights_np = checkpoint["class_weights"]
-        class_weights = torch.tensor(class_weights_np, dtype=torch.float32).to(device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-    else:
-        criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
     print("\n" + "-" * 80)
     print(f"Evaluating DRO OOD seed {seed}, selected epoch {selected_epoch}")
@@ -788,14 +756,14 @@ def evaluate_selected_epoch_for_seed(
         final_val,
         split_name="ood_validation",
         seed=seed,
-        method_name="resnet50_dro",
+        method_name="resnet50_dro_unweighted",
     )
 
     hold_per_class = compute_per_class_table(
         final_hold,
         split_name="ood_hold",
         seed=seed,
-        method_name="resnet50_dro",
+        method_name="resnet50_dro_unweighted",
     )
 
     per_class = pd.concat([val_per_class, hold_per_class], ignore_index=True)
@@ -808,7 +776,7 @@ def evaluate_selected_epoch_for_seed(
         env_col,
         split_name="ood_validation",
         seed=seed,
-        method_name="resnet50_dro",
+        method_name="resnet50_dro_unweighted",
     )
 
     hold_per_env = compute_per_environment_table(
@@ -818,7 +786,7 @@ def evaluate_selected_epoch_for_seed(
         env_col,
         split_name="ood_hold",
         seed=seed,
-        method_name="resnet50_dro",
+        method_name="resnet50_dro_unweighted",
     )
 
     if len(val_per_env) > 0:
@@ -964,7 +932,6 @@ def main():
 
         history_df = train_one_seed(
             seed=seed,
-            train_df=train_df,
             train_loader=train_loader,
             val_loader=val_loader,
             device=device,
@@ -1070,96 +1037,16 @@ def main():
     aggregate_df = pd.DataFrame(aggregate_rows)
     aggregate_df.to_csv(OUTPUT_DIR / "final_results_mean_std_se_selected_1se.csv", index=False)
 
-    per_class_all = []
-
-    for seed in SEEDS:
-        path = OUTPUT_DIR / f"seed_{seed}" / "per_class_metrics_selected_1se.csv"
-        if path.exists():
-            per_class_all.append(pd.read_csv(path))
-
-    if per_class_all:
-        per_class_all_df = pd.concat(per_class_all, ignore_index=True)
-        per_class_all_df.to_csv(OUTPUT_DIR / "all_seed_per_class_metrics_selected_1se.csv", index=False)
-
-        per_class_summary = (
-            per_class_all_df.groupby(["split", "class_id", "class_name"])["f1"]
-            .agg(["mean", "std", "min", "max", "count"])
-            .reset_index()
-            .rename(
-                columns={
-                    "mean": "f1_mean",
-                    "std": "f1_std",
-                    "min": "f1_min",
-                    "max": "f1_max",
-                    "count": "num_seeds",
-                }
-            )
-        )
-
-        per_class_summary["f1_se"] = per_class_summary["f1_std"] / np.sqrt(
-            per_class_summary["num_seeds"]
-        )
-
-        per_class_summary.to_csv(
-            OUTPUT_DIR / "per_class_metrics_mean_std_se_selected_1se.csv",
-            index=False,
-        )
-
-    per_env_all = []
-
-    for seed in SEEDS:
-        for split_name in ["ood_val", "ood_hold"]:
-            path = OUTPUT_DIR / f"seed_{seed}" / f"{split_name}_per_environment_metrics_selected_1se.csv"
-            if path.exists():
-                per_env_all.append(pd.read_csv(path))
-
-    if per_env_all:
-        per_env_all_df = pd.concat(per_env_all, ignore_index=True)
-        per_env_all_df.to_csv(OUTPUT_DIR / "all_seed_per_environment_metrics_selected_1se.csv", index=False)
-
-        per_env_summary = (
-            per_env_all_df.groupby(["split", "environment"])["macro_f1"]
-            .agg(["mean", "std", "min", "max", "count"])
-            .reset_index()
-            .rename(
-                columns={
-                    "mean": "macro_f1_mean",
-                    "std": "macro_f1_std",
-                    "min": "macro_f1_min",
-                    "max": "macro_f1_max",
-                    "count": "num_seeds",
-                }
-            )
-        )
-
-        per_env_summary["macro_f1_se"] = per_env_summary["macro_f1_std"] / np.sqrt(
-            per_env_summary["num_seeds"]
-        )
-
-        per_env_summary.to_csv(
-            OUTPUT_DIR / "per_environment_metrics_mean_std_se_selected_1se.csv",
-            index=False,
-        )
-
-        hold_env_summary = per_env_summary[per_env_summary["split"] == "ood_hold"].copy()
-
-        if len(hold_env_summary) > 0:
-            worst_env_row = hold_env_summary.sort_values("macro_f1_mean").iloc[0].to_dict()
-        else:
-            worst_env_row = None
-    else:
-        worst_env_row = None
-
     final_summary = {
-        "method": "resnet50_dro",
-        "method_description": "DRO objective over disaster-location environments using train-based class-weighted cross entropy.",
+        "method": "resnet50_dro_unweighted",
+        "method_description": "DRO objective over disaster-location environments using unweighted cross entropy with label smoothing.",
         "seeds": SEEDS,
         "num_seeds": len(SEEDS),
         "batch_size": BATCH_SIZE,
         "epochs": NUM_EPOCHS,
         "learning_rate": LEARNING_RATE,
         "num_workers": NUM_WORKERS,
-        "use_class_weights": USE_CLASS_WEIGHTS,
+        "label_smoothing": LABEL_SMOOTHING,
         "dro_eta": DRO_ETA,
         "dro_avg_risk_weight": DRO_AVG_RISK_WEIGHT,
         "dro_worst_risk_weight": DRO_WORST_RISK_WEIGHT,
@@ -1177,7 +1064,6 @@ def main():
         "ood_hold_size": int(len(hold_df)),
         "model_selection": selection_info,
         "final_metric_summary": aggregate_df.to_dict(orient="records"),
-        "worst_ood_hold_environment_by_mean_macro_f1": worst_env_row,
     }
 
     with open(OUTPUT_DIR / "final_summary_selected_1se.json", "w", encoding="utf-8") as f:
@@ -1187,10 +1073,6 @@ def main():
     print("Final DRO OOD mean, std, and SE across seeds")
     print("=" * 80)
     print(aggregate_df)
-
-    if worst_env_row is not None:
-        print("\nWorst OOD hold environment by mean macro F1:")
-        print(worst_env_row)
 
     print("\nSaved all DRO OOD outputs successfully.")
     print(OUTPUT_DIR)
