@@ -11,7 +11,7 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
 )
-from sklearn.utils.class_weight import compute_class_weight
+
 from tqdm.auto import tqdm
 
 import torch
@@ -25,9 +25,10 @@ from torchvision.models import resnet50, ResNet50_Weights
 # =========================
 
 BASE_DIR = Path.home() / "Desktop"
+
 CSV_PATH = BASE_DIR / "processed" / "buildings_all_with_crops.csv"
 
-OUTPUT_DIR = BASE_DIR / "training_outputs" / "baseline_resnet50_5seeds_1se"
+OUTPUT_DIR = BASE_DIR / "training_outputs" / "unweighted_baseline_resnet50_5seeds_1se"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SEEDS = [42, 123, 999, 2024, 2025]
@@ -36,7 +37,7 @@ BATCH_SIZE = 32
 NUM_EPOCHS = 8
 LEARNING_RATE = 1e-4
 NUM_WORKERS = 2
-USE_CLASS_WEIGHTS = True
+USE_CLASS_WEIGHTS = False
 
 TRAIN_SPLIT = "train"
 VAL_SPLIT = "test"
@@ -413,31 +414,15 @@ def train_one_seed(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 80)
-    print(f"Starting baseline seed {seed}")
+    print(f"Starting unweighted baseline seed {seed}")
     print("=" * 80)
 
     model = ResNet50SixChannel(num_classes=4).to(device)
 
-    if USE_CLASS_WEIGHTS:
-        y_train = train_df["damage_label"].map(LABEL_TO_IDX).values
-        present_classes = set(y_train.tolist())
-        missing_classes = set(LABEL_IDS) - present_classes
+    criterion = nn.CrossEntropyLoss()
+    weights = None
 
-        if missing_classes:
-            raise ValueError(f"Missing classes in training data: {missing_classes}")
-
-        weights = compute_class_weight(
-            class_weight="balanced",
-            classes=np.array(LABEL_IDS),
-            y=y_train,
-        )
-        weights = torch.tensor(weights, dtype=torch.float32).to(device)
-        criterion = nn.CrossEntropyLoss(weight=weights)
-        print("\nUsing class weights:", weights.cpu().numpy())
-    else:
-        criterion = nn.CrossEntropyLoss()
-        weights = None
-        print("\nUsing unweighted cross entropy.")
+    print("\nUsing unweighted cross entropy.")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
@@ -613,15 +598,10 @@ def evaluate_selected_epoch_for_seed(
 
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    if USE_CLASS_WEIGHTS:
-        class_weights = checkpoint["class_weights"]
-        class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-    else:
-        criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss()
 
     print("\n" + "-" * 80)
-    print(f"Evaluating baseline seed {seed}, selected epoch {selected_epoch}")
+    print(f"Evaluating unweighted baseline seed {seed}, selected epoch {selected_epoch}")
     print("-" * 80)
 
     final_val = evaluate(
@@ -698,14 +678,14 @@ def evaluate_selected_epoch_for_seed(
         final_val,
         split_name="validation",
         seed=seed,
-        method_name="baseline_resnet50",
+        method_name="unweighted_baseline_resnet50",
     )
 
     hold_per_class = compute_per_class_table(
         final_hold,
         split_name="hold",
         seed=seed,
-        method_name="baseline_resnet50",
+        method_name="unweighted_baseline_resnet50",
     )
 
     per_class = pd.concat([val_per_class, hold_per_class], ignore_index=True)
@@ -718,7 +698,7 @@ def evaluate_selected_epoch_for_seed(
         env_col,
         split_name="validation",
         seed=seed,
-        method_name="baseline_resnet50",
+        method_name="unweighted_baseline_resnet50",
     )
 
     hold_per_env = compute_per_environment_table(
@@ -728,7 +708,7 @@ def evaluate_selected_epoch_for_seed(
         env_col,
         split_name="hold",
         seed=seed,
-        method_name="baseline_resnet50",
+        method_name="unweighted_baseline_resnet50",
     )
 
     if len(val_per_env) > 0:
@@ -1044,7 +1024,7 @@ def main():
         worst_env_row = None
 
     final_summary = {
-        "method": "baseline_resnet50",
+        "method": "unweighted_baseline_resnet50",
         "seeds": SEEDS,
         "num_seeds": len(SEEDS),
         "batch_size": BATCH_SIZE,
@@ -1069,7 +1049,7 @@ def main():
         json.dump(make_json_safe(final_summary), f, indent=2)
 
     print("\n" + "=" * 80)
-    print("Final baseline mean, std, and SE across seeds")
+    print("Final unweighted baseline mean, std, and SE across seeds")
     print("=" * 80)
     print(aggregate_df)
 
@@ -1077,7 +1057,7 @@ def main():
         print("\nWorst hold environment by mean macro F1:")
         print(worst_env_row)
 
-    print("\nSaved all baseline split outputs successfully.")
+    print("\nSaved all unweighted baseline split outputs successfully.")
     print(OUTPUT_DIR)
 
 
