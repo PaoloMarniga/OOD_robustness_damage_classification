@@ -139,7 +139,7 @@ This protocol is designed to better approximate deployment conditions in which a
 
 # Required Data
 
-Download the xView2 dataset and place the following folders in the configured data directory:
+Download the xView2 dataset and place the following folders on desktop:
 
 ```text
 train/
