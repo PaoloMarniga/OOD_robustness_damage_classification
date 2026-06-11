@@ -27,3 +27,5 @@ torchvision==0.23.0
 jupyter==1.0.0
 ipykernel==6.29.4
 tqdm==4.66.2
+
+gurobipy==13.0.2
