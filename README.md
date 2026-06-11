@@ -344,6 +344,10 @@ All models use:
 
 This allows differences in performance to be more directly attributed to the robustness strategy under evaluation.
 
+### Important note
+
+The location-based OOD split is generated using Gurobi via `gurobipy`. A valid Gurobi license is required to rerun the optimization step. The trained model experiments use the generated OOD split files and do not require rerunning the optimizer once those files have been created.
+
 ---
 
 # Acknowledgements
